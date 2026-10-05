@@ -24,6 +24,8 @@
 --
 -------------------------------------------------------------------------------
 
+local issecretvalue = issecretvalue or function() return false end
+
 Prat:AddModuleToLoad(function()
 	local module = Prat:NewModule("CustomFilters", "LibSink-2.0")
 	local PL = module.PL
@@ -91,6 +93,12 @@ Prat:AddModuleToLoad(function()
 	local patterndefaults = {
 		["*"] = {
 			enabled = true,
+			-- Existing filters have no saved matchtype, so this must stay "pattern" to
+			-- preserve their behavior. New filters get "text" explicitly in AddPattern.
+			matchtype = "pattern",
+			ignorecase = false,
+			wholeword = false,
+			ignoreself = false,
 			sink20OutputSink = "None",
 			replacement_is_code = false,
 			outputmessageonly = true,
@@ -137,6 +145,15 @@ Prat:AddModuleToLoad(function()
 			}
 		}
 	}
+	-- Chat types a new inbound filter searches by default: public chat only.
+	-- CHANNEL covers numbered channels (Trade, General, ...) unless one is set individually.
+	local PUBLIC_CHAT_TYPES = {
+		SAY = true,
+		YELL = true,
+		EMOTE = true,
+		CHANNEL = true,
+	}
+
 	Prat:SetModuleDefaults(module, {
 		profile = {
 			on = false,
@@ -275,6 +292,15 @@ Prat:AddModuleToLoad(function()
 				get = "GetPatternValue",
 				set = "UpdatePatternValue",
 			},
+			delete = {
+				order = 6,
+				type = "execute",
+				name = PL["Delete Filter"],
+				desc = PL["Permanently remove this filter"],
+				func = "DeletePatternOption",
+				confirm = true,
+				confirmText = PL["Delete this filter?"],
+			},
 			opspc9 = {
 				name = PL["Pattern Info"],
 				type = "header",
@@ -284,10 +310,49 @@ Prat:AddModuleToLoad(function()
 				order = 10,
 				type = "input",
 				name = PL["Search Pattern"],
-				desc = PL["Search Pattern"],
+				desc = "GetSearchDesc",
 				usage = PL["<string>"],
 				get = "GetPatternValue",
 				set = "UpdatePatternValue"
+			},
+			matchtype = {
+				order = 11,
+				type = "select",
+				name = PL["Match Type"],
+				desc = PL["How the search text is interpreted"],
+				values = {
+					text = PL["Plain Text"],
+					pattern = PL["Lua Pattern"],
+				},
+				get = "GetPatternValue",
+				set = "UpdatePatternValue",
+			},
+			ignorecase = {
+				order = 12,
+				type = "toggle",
+				name = PL["Ignore Case"],
+				desc = PL["Match upper and lower case letters alike"],
+				get = "GetPatternValue",
+				set = "UpdatePatternValue",
+				disabled = "GetDisableTextOptions",
+			},
+			wholeword = {
+				order = 13,
+				type = "toggle",
+				name = PL["Whole Word"],
+				desc = PL["Only match complete words, not parts of longer words"],
+				get = "GetPatternValue",
+				set = "UpdatePatternValue",
+				disabled = "GetDisableTextOptions",
+			},
+			ignoreself = {
+				order = 105,
+				type = "toggle",
+				name = PL["Ignore My Messages"],
+				desc = PL["Don't filter messages you send yourself, including your outgoing whispers"],
+				get = "GetPatternValue",
+				set = "UpdatePatternValue",
+				hidden = "IsOutboundOption",
 			},
 			inchannels = {
 				name = PL["inchannels_name"],
@@ -387,7 +452,62 @@ Prat:AddModuleToLoad(function()
 
 	local CLR = Prat.CLR
 
-	local function match(text, matchopts, mode)
+	-- Characters that have special meaning in Lua patterns
+	local MAGIC_CHARS = "([%^%$%(%)%%%.%[%]%*%+%-%?])"
+	-- ASCII letters/digits plus any UTF-8 byte, so multi-byte letters are part of a word
+	local WORD_CHARS = "%w\128-\255"
+
+	local function caseFold(c)
+		return "[" .. c:lower() .. c:upper() .. "]"
+	end
+
+	-- Build the Lua pattern used for matching from a filter's settings
+	function module.CompileFilter(matchopts)
+		local search = matchopts.searchfor
+		if type(search) ~= "string" or search == "" then
+			return ""
+		end
+
+		if matchopts.matchtype ~= "text" then
+			return search
+		end
+
+		local pattern = search:gsub(MAGIC_CHARS, "%%%1")
+
+		if matchopts.ignorecase then
+			pattern = pattern:gsub("[A-Za-z]", caseFold)
+		end
+
+		-- A frontier can only match where a word character starts/ends the search
+		-- text, so only add one on the sides where that is true
+		if matchopts.wholeword then
+			if search:find("^[" .. WORD_CHARS .. "]") then
+				pattern = "%f[" .. WORD_CHARS .. "]" .. pattern
+			end
+			if search:find("[" .. WORD_CHARS .. "]$") then
+				pattern = pattern .. "%f[^" .. WORD_CHARS .. "]"
+			end
+		end
+
+		return pattern
+	end
+
+	-- The echo of an outgoing whisper carries the recipient's GUID, so it is
+	-- identified by chat type instead
+	local OWN_ECHO_TYPES = {
+		WHISPER_INFORM = true,
+		BN_WHISPER_INFORM = true,
+	}
+
+	local function isOwnMessage(message)
+		if OWN_ECHO_TYPES[message.CHATTYPE] then
+			return true
+		end
+		local guid = message.GUID
+		return guid ~= nil and not issecretvalue(guid) and guid == UnitGUID("player")
+	end
+
+	local function match(text, matchopts, mode, pattern)
 		if (not matchopts) or (not matchopts.enabled) then
 			return
 		end
@@ -402,6 +522,10 @@ Prat:AddModuleToLoad(function()
 		local textout = text
 
 		if mode == "inbound" then
+			if matchopts.ignoreself and isOwnMessage(Prat.SplitMessage) then
+				return
+			end
+
 			local chatype = Prat.SplitMessage.CHATTYPE
 			local typeopt = matchopts.inchannels[chatype]
 
@@ -425,7 +549,7 @@ Prat:AddModuleToLoad(function()
 			if matchopts.replacement_is_code then
 				textout = loadstring(matchopts.replacewith)(text)
 			else
-				textout = textout:gsub(matchopts.searchfor, matchopts.replacewith)
+				textout = textout:gsub(pattern, matchopts.replacewith)
 			end
 		end
 
@@ -472,18 +596,36 @@ Prat:AddModuleToLoad(function()
 		return textout
 	end
 
+	-- Returns the registered patterninfo for a filter, and its index in modulePatterns
+	function module:FindPatternInfo(matchopts)
+		if not self.modulePatterns then
+			return
+		end
+		for i, v in ipairs(self.modulePatterns) do
+			if v.matchopts == matchopts then
+				return v, i
+			end
+		end
+	end
+
 	function module:RegisterPattern(matchopts, mode)
+		-- modulePatterns only exists while the module is enabled
+		if not self.modulePatterns then
+			return
+		end
+
 		local matchtype
 		if mode == "inbound" then
 			matchtype = "FRAME"
 		else
 			matchtype = "OUTBOUND"
 		end
+		local pattern = self.CompileFilter(matchopts)
 		local patterninfo = {
-			pattern = matchopts.searchfor,
+			pattern = pattern,
 			matchopts = matchopts,
 			matchfunc = function(text)
-				return match(text, matchopts, mode)
+				return match(text, matchopts, mode, pattern)
 			end,
 			type = matchtype,
 			deformat = matchopts.deformat,
@@ -496,13 +638,7 @@ Prat:AddModuleToLoad(function()
 	end
 
 	function module:UnregisterPattern(matchopts)
-		local patterninfo
-		for _, v in pairs(self.modulePatterns) do
-			if v.matchopts == matchopts then
-				patterninfo = v
-			end
-		end
-
+		local patterninfo, idx = self:FindPatternInfo(matchopts)
 		if patterninfo == nil then
 			return
 		end
@@ -511,24 +647,11 @@ Prat:AddModuleToLoad(function()
 			Prat:UnregisterPattern(patterninfo.idx)
 		end
 
-		local idx
-		for k, v in pairs(self.modulePatterns) do
-			if v == patterninfo then
-				idx = k
-			end
-		end
-
 		table.remove(self.modulePatterns, idx)
 	end
 
 	function module:UpdatePattern(matchopts)
-		local patterninfo
-		for _, v in pairs(self.modulePatterns) do
-			if v.matchopts == matchopts then
-				patterninfo = v
-			end
-		end
-
+		local patterninfo = self:FindPatternInfo(matchopts)
 		if patterninfo == nil then
 			return
 		end
@@ -540,10 +663,27 @@ Prat:AddModuleToLoad(function()
 			mode = "outbound"
 		end
 
-		patterninfo.pattern = matchopts.searchfor
+		local pattern = self.CompileFilter(matchopts)
+		patterninfo.pattern = pattern
 		patterninfo.deformat = matchopts.deformat
 		patterninfo.matchfunc = function(text)
-			return match(text, matchopts, mode)
+			return match(text, matchopts, mode, pattern)
+		end
+	end
+
+	-- Bring a filter's registration in line with its settings. Filters that were
+	-- disabled at load are never registered, so enabling one has to register it.
+	function module:SyncPattern(matchopts, mode)
+		if not self.modulePatterns then
+			return
+		end
+
+		if not matchopts.enabled then
+			self:UnregisterPattern(matchopts)
+		elseif self:FindPatternInfo(matchopts) then
+			self:UpdatePattern(matchopts)
+		else
+			self:RegisterPattern(matchopts, mode)
 		end
 	end
 
@@ -636,8 +776,10 @@ Prat:AddModuleToLoad(function()
 	end
 
 	function module:UpdatePatternValue(info, v)
-		self.db.profile[info[#info - 2]][info[#info - 1]][info[#info]] = v
-		self:UpdatePattern(self.db.profile[info[#info - 2]][info[#info - 1]])
+		local mode = info[#info - 2]
+		local matchopts = self.db.profile[mode][info[#info - 1]]
+		matchopts[info[#info]] = v
+		self:SyncPattern(matchopts, mode)
 	end
 
 	function module:SetPatternValue(info, v)
@@ -715,6 +857,21 @@ Prat:AddModuleToLoad(function()
 		return p.block or p.tosink
 	end
 
+	function module:GetDisableTextOptions(info)
+		return self.db.profile[info[#info - 2]][info[#info - 1]].matchtype ~= "text"
+	end
+
+	function module:IsOutboundOption(info)
+		return info[#info - 2] == "outbound"
+	end
+
+	function module:GetSearchDesc(info)
+		if self.db.profile[info[#info - 2]][info[#info - 1]].matchtype == "text" then
+			return PL["Text to search for"]
+		end
+		return PL["Lua pattern to search for"]
+	end
+
 	function module:GetBlockMessage(p)
 		return p.block
 	end
@@ -779,6 +936,17 @@ Prat:AddModuleToLoad(function()
 		p[key].name = pattern
 		p[key].searchfor = pattern
 		p[key].replacewith = "%1"
+		p[key].matchtype = "text"
+		p[key].ignorecase = true
+
+		-- Only inbound filters have a channel scope and see other people's messages.
+		-- Set explicitly, as changing the stored defaults would alter existing filters.
+		if mode == "inbound" then
+			p[key].ignoreself = true
+			for chatType in pairs(patterndefaults["*"].inchannels) do
+				p[key].inchannels[chatType] = PUBLIC_CHAT_TYPES[chatType] or false
+			end
+		end
 
 		v[key] = pattern
 
@@ -814,6 +982,22 @@ Prat:AddModuleToLoad(function()
 		end
 
 		if key == nil then
+			return
+		end
+
+		self:DeletePattern(mode, key)
+	end
+
+	-- Delete button on an individual filter's page
+	function module:DeletePatternOption(info)
+		self:DeletePattern(info[#info - 2], info[#info - 1])
+		-- The filter's page no longer exists, so show its Inbound/Outbound parent
+		LibStub("AceConfigDialog-3.0"):SelectGroup(info.appName, unpack(info, 1, #info - 2))
+	end
+
+	function module:DeletePattern(mode, key)
+		local p = self.db.profile[mode]
+		if rawget(p, key) == nil then
 			return
 		end
 
